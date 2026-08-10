@@ -1,0 +1,23 @@
+[package]
+name = "bartizan-lsp"
+version = "0.1.0"
+edition = "2024"
+description = "Companion Rust language server supplying the code actions clippy and rust-analyzer leave unfilled"
+keywords = ["lsp", "rust-analyzer", "clippy", "code-actions", "refactoring"]
+categories = ["development-tools"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/sophietheopossum/bartizan-lsp"
+
+[dependencies]
+# rust-analyzer's own lossless syntax tree, published from rust-lang/rust-analyzer.
+# Deliberate choice over tree-sitter: transformations written against this API port
+# to a rust-analyzer assist nearly unchanged, for when the assist feature freeze
+# lifts (see CONTRIBUTING.md upstream). Pinned — 0.0.x publishes weekly with no
+# stability promise, and the rowan transition will churn it.
+ra_ap_syntax = "=0.0.346"
+tower-lsp-server = "0.23"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+
+[profile.release]
+opt-level = 2

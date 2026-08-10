@@ -1,0 +1,5 @@
+# Rust build output
+/target
+
+# VS Code client dependencies — restored with `npm install` in editors/vscode
+editors/vscode/node_modules
