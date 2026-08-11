@@ -11,13 +11,20 @@
 //! rust-analyzer instead — editors dispatch `textDocument/codeAction` to every
 //! server registered for the language, so both sets of actions appear together.
 
+mod fixes;
+mod line_index;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use ra_ap_syntax::{
+	Edition, 
+	SourceFile
+};
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
+use line_index::LineIndex;
 #[derive(Default)]
 struct Documents(Mutex<HashMap<Uri, String>>);
 
@@ -83,11 +90,49 @@ impl LanguageServer for Backend {
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
-        let Some(_text) = self.docs.get(&params.text_document.uri) else {
+        let Some(text) = self.docs.get(&params.text_document.uri) else {
             return Ok(None);
         };
-        // Transformations land here next.
-        Ok(None)
+        let index = LineIndex::new(&text);
+        let Some(offset) = index.offset(params.range.start) else {
+            return Ok(None);
+        };
+
+        // Parsing is unconditional and cheap relative to anything semantic —
+        // there is no project model here to keep warm, which is the whole reason
+        // this can sit next to a rust-analyzer already holding several GB.
+        let parse = SourceFile::parse(&text, Edition::CURRENT);
+
+        let actions: Vec<_> = fixes::all(&parse.tree(), offset)
+            .into_iter()
+            .map(|fix| {
+                let edits = fix
+                    .edits
+                    .iter()
+                    .map(|(range, new_text)| TextEdit {
+                        range: index.range(*range),
+                        new_text: new_text.clone(),
+                    })
+                    .collect();
+                let mut changes = HashMap::new();
+                changes.insert(params.text_document.uri.clone(), edits);
+
+                CodeActionOrCommand::CodeAction(CodeAction {
+                    title: fix.title,
+                    // Same kind rust-analyzer gives its assists, so these land in
+                    // the Refactor menu beside them rather than in a category of
+                    // their own.
+                    kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            })
+            .collect();
+
+        Ok((!actions.is_empty()).then_some(actions))
     }
 }
 
