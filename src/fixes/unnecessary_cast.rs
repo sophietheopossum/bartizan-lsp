@@ -22,7 +22,7 @@
 
 use ra_ap_syntax::algo::find_node_at_offset;
 use ra_ap_syntax::ast::{self, AstNode};
-use ra_ap_syntax::{SourceFile, TextSize};
+use ra_ap_syntax::{SourceFile, SyntaxKind, SyntaxNode, TextSize};
 
 use super::Fix;
 
@@ -37,12 +37,11 @@ pub fn fix(file: &SourceFile, offset: TextSize) -> Option<Fix> {
         return None;
     }
 
-    let keep = operand.syntax().text().to_string();
+    let keep = unparen(operand.clone()).syntax().text().to_string();
 
     // A cast to the type the operand was *just* cast to. The inner cast already
     // produced this type, so the outer one is a no-op whatever the operand
-    // underneath is. Parentheses are preserved rather than unwrapped: the
-    // replacement keeps the operand's own text, so precedence cannot shift.
+    // underneath is.
     if let Some(inner) = as_cast(&operand) {
         return (normalized_type(&inner.ty()?) == target).then(|| Fix {
             title: format!("Remove redundant `as {target}`"),
@@ -60,6 +59,31 @@ pub fn fix(file: &SourceFile, offset: TextSize) -> Option<Fix> {
     }
 
     None
+}
+
+/// Drop parentheses wrapping the expression we keep.
+///
+/// Unconditionally safe in both accepted branches: what survives is either a
+/// literal, which binds tighter than anything, or a cast replacing a cast,
+/// which has identical precedence — so no surrounding context can reparse the
+/// result differently. Parentheses holding a comment are left in place rather
+/// than deleting something a person wrote.
+fn unparen(expr: ast::Expr) -> ast::Expr {
+    let ast::Expr::ParenExpr(paren) = &expr else {
+        return expr;
+    };
+    if contains_comment(paren.syntax()) {
+        return expr;
+    }
+    match paren.expr() {
+        Some(inner) => unparen(inner),
+        None => expr,
+    }
+}
+
+fn contains_comment(node: &SyntaxNode) -> bool {
+    node.descendants_with_tokens()
+        .any(|element| element.kind() == SyntaxKind::COMMENT)
 }
 
 /// The operand as a cast, seeing through any parentheses around it.
@@ -132,8 +156,32 @@ mod tests {
 
     #[test]
     fn repeated_identical_cast_through_parens() {
+        // The parenthesised inner cast is still recognised, and the parens go
+        // with the outer cast — what is left is a cast where a cast was, so
+        // nothing around it can reparse.
         let got = apply("fn f(v: u8) -> u32 { (v as u32) as $0u32 }").expect("should apply");
-        assert_eq!(got, "fn f(v: u8) -> u32 { (v as u32) }");
+        assert_eq!(got, "fn f(v: u8) -> u32 { v as u32 }");
+    }
+
+    #[test]
+    fn strips_redundant_parens() {
+        let got = apply("fn f(v: u8) -> u32 { ((v as u32)) as $0u32 }").expect("should apply");
+        assert_eq!(got, "fn f(v: u8) -> u32 { v as u32 }");
+    }
+
+    #[test]
+    fn strips_parens_around_a_literal() {
+        let got = apply("fn f() -> u32 { (0u32) as $0u32 }").expect("should apply");
+        assert_eq!(got, "fn f() -> u32 { 0u32 }");
+    }
+
+    #[test]
+    fn keeps_parens_holding_a_comment() {
+        // Still offered — only the paren stripping is withheld, so the comment
+        // survives the rewrite.
+        let got =
+            apply("fn f(v: u8) -> u32 { (/* keep me */ v as u32) as $0u32 }").expect("applies");
+        assert_eq!(got, "fn f(v: u8) -> u32 { (/* keep me */ v as u32) }");
     }
 
     #[test]
