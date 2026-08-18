@@ -17,8 +17,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use ra_ap_syntax::{
-	Edition, 
-	SourceFile
+	Edition,
+	SourceFile,
+	TextRange
 };
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
@@ -103,9 +104,27 @@ impl LanguageServer for Backend {
         // this can sit next to a rust-analyzer already holding several GB.
         let parse = SourceFile::parse(&text, Edition::CURRENT);
 
-        let actions: Vec<_> = fixes::all(&parse.tree(), offset)
+        let tree = parse.tree();
+
+        // Fixes the editor asked for by name. `context.diagnostics` carries what
+        // the client already knows about this range — including rust-analyzer's
+        // clippy output — so a lint that needed the type table to *detect* can be
+        // acted on here without this server ever building one.
+        let from_diagnostics = params.context.diagnostics.iter().filter_map(|diagnostic| {
+            let NumberOrString::String(code) = diagnostic.code.as_ref()? else {
+                return None;
+            };
+            let start = index.offset(diagnostic.range.start)?;
+            let end = index.offset(diagnostic.range.end)?;
+            let fix = fixes::for_diagnostic(&tree, code, TextRange::new(start, end))?;
+            Some((fix, Some(diagnostic.clone())))
+        });
+
+        let actions: Vec<_> = fixes::all(&tree, offset)
             .into_iter()
-            .map(|fix| {
+            .map(|fix| (fix, None))
+            .chain(from_diagnostics)
+            .map(|(fix, diagnostic)| {
                 let edits = fix
                     .edits
                     .iter()
@@ -119,10 +138,17 @@ impl LanguageServer for Backend {
 
                 CodeActionOrCommand::CodeAction(CodeAction {
                     title: fix.title,
-                    // Same kind rust-analyzer gives its assists, so these land in
-                    // the Refactor menu beside them rather than in a category of
-                    // their own.
-                    kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                    // Answering a diagnostic makes it a quickfix, and naming that
+                    // diagnostic attaches it to the squiggle's own lightbulb.
+                    // Everything else keeps the kind rust-analyzer gives its
+                    // assists, so those land in the Refactor menu beside them
+                    // rather than in a category of their own.
+                    kind: Some(if diagnostic.is_some() {
+                        CodeActionKind::QUICKFIX
+                    } else {
+                        CodeActionKind::REFACTOR_REWRITE
+                    }),
+                    diagnostics: diagnostic.map(|d| vec![d]),
                     edit: Some(WorkspaceEdit {
                         changes: Some(changes),
                         ..Default::default()

@@ -16,6 +16,23 @@ pub struct Fix {
     pub edits: Vec<(TextRange, String)>,
 }
 
+/// The transformation answering `code`, a lint name the editor reported over
+/// `range`.
+///
+/// This is the other half of the server. [`all`] offers what the syntax tree can
+/// prove on its own at a cursor; this offers what a type-aware checker has
+/// already concluded, so between them a lint's whole surface is covered rather
+/// than only the shapes provable without types.
+pub fn for_diagnostic(file: &SourceFile, code: &str, range: TextRange) -> Option<Fix> {
+    // Matched on the last path segment: rust-analyzer reports clippy lints as
+    // `clippy::unnecessary_cast`, while other clients spell the same lint
+    // without the tool prefix.
+    match code.rsplit("::").next()? {
+        "unnecessary_cast" => unnecessary_cast::from_clippy(file, range),
+        _ => None,
+    }
+}
+
 /// Every transformation applicable at `offset`.
 pub fn all(file: &SourceFile, offset: TextSize) -> Vec<Fix> {
     [

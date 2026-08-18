@@ -19,10 +19,17 @@
 //! Deliberately *not* offered: rewriting an unsuffixed `1 as u32` into `1u32`.
 //! That one is squarely inside what clippy already emits a machine-applicable
 //! suggestion for, and this server exists for the gaps.
+//!
+//! [`from_clippy`] lifts the type restriction from the other direction. When the
+//! editor hands us a `clippy::unnecessary_cast` diagnostic it is passing on a
+//! judgement made *with* the type table, so there is nothing left to prove and
+//! the cast can be removed whatever the operand is. That is not a retreat from
+//! declining — it is declining to guess when something that knows has already
+//! answered.
 
 use ra_ap_syntax::algo::find_node_at_offset;
 use ra_ap_syntax::ast::{self, AstNode};
-use ra_ap_syntax::{SourceFile, SyntaxKind, SyntaxNode, TextSize};
+use ra_ap_syntax::{SourceFile, SyntaxKind, SyntaxNode, TextRange, TextSize};
 
 use super::Fix;
 
@@ -59,6 +66,69 @@ pub fn fix(file: &SourceFile, offset: TextSize) -> Option<Fix> {
     }
 
     None
+}
+
+/// Remove a cast clippy has already judged unnecessary.
+///
+/// `range` is the diagnostic's span, which clippy reports over the whole cast
+/// expression. The operand replaces it verbatim; the only judgement left is
+/// whether parentheses around that operand can go, which is a question about
+/// precedence and so answerable from syntax alone.
+pub fn from_clippy(file: &SourceFile, range: TextRange) -> Option<Fix> {
+    let cast = file
+        .syntax()
+        .covering_element(range)
+        .ancestors()
+        .find_map(ast::CastExpr::cast)?;
+    let operand = cast.expr()?;
+    let ty = normalized_type(&cast.ty()?);
+
+    let keep = if binds_at_least_as_tight_as_cast(&operand) {
+        unparen(operand).syntax().text().to_string()
+    } else {
+        // A binary operator, range or closure binds looser than `as`, so the
+        // parentheses the author wrote are load-bearing: `x * (a + b) as u32`
+        // must not become `x * a + b`.
+        operand.syntax().text().to_string()
+    };
+
+    Some(Fix {
+        title: format!("Remove unnecessary `as {ty}`"),
+        edits: vec![(cast.syntax().text_range(), keep)],
+    })
+}
+
+/// Whether `expr` can stand unparenthesised where a cast stood.
+///
+/// A cast binds tighter than every binary operator, so only operands that bind
+/// at least as tightly are safe to unwrap. Deliberately a whitelist: an
+/// unrecognised expression is assumed to need its parentheses.
+fn binds_at_least_as_tight_as_cast(expr: &ast::Expr) -> bool {
+    let inner = match expr {
+        ast::Expr::ParenExpr(p) => match p.expr() {
+            Some(inner) => inner,
+            None => return false,
+        },
+        other => other.clone(),
+    };
+    matches!(
+        inner,
+        ast::Expr::Literal(_)
+            | ast::Expr::PathExpr(_)
+            | ast::Expr::CallExpr(_)
+            | ast::Expr::MethodCallExpr(_)
+            | ast::Expr::FieldExpr(_)
+            | ast::Expr::IndexExpr(_)
+            | ast::Expr::TupleExpr(_)
+            | ast::Expr::ArrayExpr(_)
+            | ast::Expr::ParenExpr(_)
+            | ast::Expr::MacroExpr(_)
+            | ast::Expr::CastExpr(_)
+            | ast::Expr::PrefixExpr(_)
+            | ast::Expr::RefExpr(_)
+            | ast::Expr::TryExpr(_)
+            | ast::Expr::AwaitExpr(_)
+    )
 }
 
 /// Drop parentheses wrapping the expression we keep.
@@ -127,6 +197,23 @@ fn normalized_type(ty: &ast::Type) -> String {
 mod tests {
     use super::*;
     use ra_ap_syntax::Edition;
+
+    /// Applies `from_clippy` over the span of `cast`, standing in for the
+    /// diagnostic range the editor would report for that cast expression.
+    fn apply_clippy(text: &str, cast: &str) -> Option<String> {
+        let start = text.find(cast).expect("cast source not found in text");
+        let range = TextRange::new(
+            TextSize::new(start as u32),
+            TextSize::new((start + cast.len()) as u32),
+        );
+        let parse = SourceFile::parse(text, Edition::CURRENT);
+        let fix = from_clippy(&parse.tree(), range)?;
+
+        let mut out = text.to_owned();
+        let (range, new) = fix.edits.into_iter().next().expect("one edit");
+        out.replace_range(usize::from(range.start())..usize::from(range.end()), &new);
+        Some(out)
+    }
 
     /// Applies the fix at the `$0` marker, or returns None if it declines.
     fn apply(marked: &str) -> Option<String> {
@@ -240,6 +327,50 @@ mod tests {
     #[test]
     fn declines_inference_placeholder() {
         declines("fn f(v: u8) -> u32 { v as _ as $0_ }");
+    }
+
+    #[test]
+    fn clippy_removes_a_cast_no_syntax_could_prove() {
+        // The case `fix` refuses on purpose: only the type table knows `v` is
+        // already a `u32`. With clippy saying so, there is nothing left to prove.
+        let got = apply_clippy("fn f(v: u32) -> u32 { v as u32 }", "v as u32").expect("applies");
+        assert_eq!(got, "fn f(v: u32) -> u32 { v }");
+    }
+
+    #[test]
+    fn clippy_keeps_load_bearing_parens() {
+        // `as` binds tighter than `*`, so the parentheses are doing real work:
+        // dropping them would silently reassociate the arithmetic.
+        let got = apply_clippy(
+            "fn f(x: u32, a: u32, b: u32) -> u32 { x * (a + b) as u32 }",
+            "(a + b) as u32",
+        )
+        .expect("applies");
+        assert_eq!(got, "fn f(x: u32, a: u32, b: u32) -> u32 { x * (a + b) }");
+    }
+
+    #[test]
+    fn clippy_strips_parens_that_are_not_load_bearing() {
+        let got =
+            apply_clippy("fn f(v: u32) -> u32 { (v) as u32 }", "(v) as u32").expect("applies");
+        assert_eq!(got, "fn f(v: u32) -> u32 { v }");
+    }
+
+    #[test]
+    fn clippy_removes_a_same_constness_pointer_cast() {
+        // Clippy marks exactly this shape MaybeIncorrect, which is why it can be
+        // missing from the editor's own quickfix list.
+        let got = apply_clippy(
+            "fn f(p: *const u8) -> *const u8 { p as *const u8 }",
+            "p as *const u8",
+        )
+        .expect("applies");
+        assert_eq!(got, "fn f(p: *const u8) -> *const u8 { p }");
+    }
+
+    #[test]
+    fn clippy_range_not_covering_a_cast_declines() {
+        assert_eq!(apply_clippy("fn f(v: u32) -> u32 { v }", "v }"), None);
     }
 
     #[test]
