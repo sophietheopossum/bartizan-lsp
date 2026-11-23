@@ -18,6 +18,3 @@ repository = "https://github.com/sophietheopossum/bartizan-lsp"
 ra_ap_syntax = "=0.0.346"
 tower-lsp-server = "0.23"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
-
-[profile.release]
-opt-level = 2
