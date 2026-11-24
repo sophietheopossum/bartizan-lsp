@@ -9,6 +9,13 @@ license = "MIT"
 readme = "README.md"
 repository = "https://github.com/sophietheopossum/bartizan-lsp"
 
+# A library: MinkaDE's one binary (minka/, at the top of the checkout) runs it
+# under the name it was started as. Nothing is built from here alone.
+[lib]
+name = "bartizan_lsp"
+path = "src/lib.rs"
+doctest = false
+
 [dependencies]
 # rust-analyzer's own lossless syntax tree, published from rust-lang/rust-analyzer.
 # Deliberate choice over tree-sitter: transformations written against this API port
